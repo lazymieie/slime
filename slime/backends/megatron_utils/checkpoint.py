@@ -138,6 +138,17 @@ def _load_checkpoint_hf(ddp_model, optimizer, args, load_path: str):
         bridge = megatron_bridge_utils.patch_auto_bridge_hf_config(
             AutoBridge.from_hf_pretrained(load_path, trust_remote_code=True)
         )
+        # Patch: Megatron-Bridge does not know how to shard
+        # LinearCrossEntropyModule by default. It is used by
+        # language_model.output_layer.weight, so register it as column-parallel.
+        try:
+            from megatron.bridge.models.conversion.param_mapping import AutoMapping
+
+            AutoMapping.register_module_type("LinearCrossEntropyModule", "column")
+            print("[slime patch] register LinearCrossEntropyModule as column")
+        except Exception as e:
+            print(f"[slime patch] register LinearCrossEntropyModule failed: {e}")
+
         bridge.load_hf_weights(ddp_model)
 
     # Copied from Megatron-core :: load_checkpoint (with simplifications)

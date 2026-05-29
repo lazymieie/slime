@@ -7,7 +7,17 @@ from argparse import Namespace
 from collections.abc import Callable
 from contextlib import contextmanager
 from typing import Any
+import asyncio
+import logging
+import os
+import time
 
+import httpx
+
+logger = logging.getLogger(__name__)
+
+_SGLANG_GENERATE_READY_CHECKED = False
+_SGLANG_GENERATE_READY_LOCK = None
 import numpy as np
 import pybase64
 import sglang_router
@@ -147,8 +157,98 @@ class GenerateState(metaclass=SingletonMeta):
                 )
             )
         self.remaining_batch_size += len(samples)
+async def wait_sglang_generate_ready(url: str, force: bool = False):
+    """
+    Wait until RolloutManager/SGLang router can actually serve /generate.
 
+    force=False: only check once globally.
+    force=True: always re-check, used after /generate fails or after circuit breaker opens.
+    """
+    global _SGLANG_GENERATE_READY_CHECKED
+    global _SGLANG_GENERATE_READY_LOCK
 
+    if _SGLANG_GENERATE_READY_CHECKED and not force:
+        return
+
+    if _SGLANG_GENERATE_READY_LOCK is None:
+        _SGLANG_GENERATE_READY_LOCK = asyncio.Lock()
+
+    async with _SGLANG_GENERATE_READY_LOCK:
+        # Important: only skip inside lock when not forced.
+        if _SGLANG_GENERATE_READY_CHECKED and not force:
+            return
+
+        enabled = os.environ.get("SLIME_WAIT_SGLANG_GENERATE_READY", "1")
+        if enabled.lower() in ("0", "false", "no"):
+            logger.warning("[slime patch] skip waiting for SGLang /generate ready")
+            _SGLANG_GENERATE_READY_CHECKED = True
+            return
+
+        timeout_s = int(os.environ.get("SLIME_SGLANG_READY_TIMEOUT", "900"))
+        interval_s = int(os.environ.get("SLIME_SGLANG_READY_INTERVAL", "5"))
+
+        # Consecutive successes are more reliable than one success, because
+        # the router may have multiple backend workers and circuit breakers.
+        required_success = int(os.environ.get("SLIME_SGLANG_READY_SUCCESS", "8"))
+        success_count = 0
+
+        probe_payload = {
+            "text": "hello",
+            "sampling_params": {
+                "max_new_tokens": 1,
+                "temperature": 0.0,
+            },
+        }
+
+        start = time.time()
+        last_err = None
+
+        logger.warning(
+            "[slime patch] waiting for SGLang /generate ready: %s, force=%s, required_success=%s",
+            url,
+            force,
+            required_success,
+        )
+
+        async with httpx.AsyncClient(timeout=30) as client:
+            while time.time() - start < timeout_s:
+                try:
+                    resp = await client.post(url, json=probe_payload)
+
+                    if resp.status_code == 200:
+                        success_count += 1
+                        logger.warning(
+                            "[slime patch] SGLang /generate probe success %s/%s: %s",
+                            success_count,
+                            required_success,
+                            url,
+                        )
+
+                        if success_count >= required_success:
+                            logger.warning("[slime patch] SGLang /generate is ready: %s", url)
+                            _SGLANG_GENERATE_READY_CHECKED = True
+                            return
+                    else:
+                        success_count = 0
+                        last_err = f"status={resp.status_code}, body={resp.text[:500]}"
+
+                except Exception as e:
+                    success_count = 0
+                    last_err = repr(e)
+
+                logger.warning(
+                    "[slime patch] SGLang /generate not ready yet, sleep %ss, "
+                    "success_count=%s/%s, last_err=%s",
+                    interval_s,
+                    success_count,
+                    required_success,
+                    last_err,
+                )
+                await asyncio.sleep(interval_s)
+
+        raise RuntimeError(
+            f"SGLang /generate not ready after {timeout_s}s: {url}, last_err={last_err}"
+        )
 async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, Any]) -> Sample:
     """Generate using traditional SGLang router with token-based workflow"""
     if args.ci_test:
@@ -156,6 +256,8 @@ async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, A
 
     state = GenerateState(args)
     url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}/generate"
+
+    await wait_sglang_generate_ready(url)
 
     assert (
         sample.status == Sample.Status.PENDING or sample.status == Sample.Status.ABORTED
@@ -197,9 +299,34 @@ async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, A
         if getattr(args, "router_policy", None) == "consistent_hashing":
             headers = {"X-SMG-Routing-Key": sample.session_id}
 
+    # with trace_span(sample, "sglang_generate", attrs={"max_new_tokens": sampling_params["max_new_tokens"]}) as span:
+    #     output = await post(url, payload, headers=headers)
+    #     span.update(build_sglang_meta_trace_attrs(output["meta_info"]))
+
     with trace_span(sample, "sglang_generate", attrs={"max_new_tokens": sampling_params["max_new_tokens"]}) as span:
-        output = await post(url, payload, headers=headers)
-        span.update(build_sglang_meta_trace_attrs(output["meta_info"]))
+        last_err = None
+        retry_times = int(os.environ.get("SLIME_SGLANG_GENERATE_RETRY", "20"))
+        retry_sleep = int(os.environ.get("SLIME_SGLANG_RETRY_SLEEP", "5"))
+
+        for attempt in range(retry_times):
+            try:
+                output = await post(url, payload, headers=headers)
+                span.update(build_sglang_meta_trace_attrs(output["meta_info"]))
+                break
+            except Exception as e:
+                last_err = e
+                logger.warning(
+                    "[slime patch] /generate failed, wait and retry. attempt=%s/%s, err=%r",
+                    attempt + 1,
+                    retry_times,
+                    e,
+                )
+
+                # Reset local readiness flag and force probe again.
+                await wait_sglang_generate_ready(url, force=True)
+                await asyncio.sleep(retry_sleep)
+        else:
+            raise last_err
 
     if "output_token_logprobs" in output["meta_info"]:
         new_response_tokens = [item[1] for item in output["meta_info"]["output_token_logprobs"]]

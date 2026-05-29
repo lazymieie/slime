@@ -1,26 +1,26 @@
 #!/bin/bash
 
-# Qwen3.5-35B-A3B VL RL training on geo3k dataset
-# 
+# Qwen3.5-4B VL/RL training on geo3k dataset
+
 # pip install -U transformers
 
 # IMPORTANT: This branch is specially modified for slime's current Megatron
 # version and Qwen3.5 from the main Megatron Bridge. Other models are not verified!
-# To restore the original Megatron Bridge, run:
-#   pip install git+https://github.com/fzyzcjy/Megatron-Bridge.git@dev_rl --no-build-isolation
-# TODO: Remove this once Megatron & Megatron Bridge are upgraded upstream.
 # pip install git+https://github.com/coding-famer/Megatron-Bridge-slime.git@qwen35 --no-build-isolation
-# export SGLANG_ENABLE_SPEC_V2=1
+
 # Configuration
 TRAIN_BACKEND="megatron"
+
 MODEL_NAME="Qwen3.5-35B-A3B"
+
 DATASET_NAME=${SLIME_SCRIPT_DATASET_NAME:-"chenhegu/geo3k_imgurl"}
 NUM_GPUS=${SLIME_SCRIPT_NUM_GPUS:-8}
 DATASET_LOCAL_NAME=$(basename "$DATASET_NAME")
+
 # ===== Modified: use local base folder, same style as previous script =====
 BASE_FOLDER=${BASE_FOLDER:-/gemini/space/gjx/slime_info}
 MODEL_PATH=${MODEL_PATH:-"${BASE_FOLDER}/${MODEL_NAME}"}
-SAVE_PATH=${SAVE_PATH:-"${BASE_FOLDER}/checkpoint/qwen3.5-35B-A3B_slime_geo3k"}
+SAVE_PATH=${SAVE_PATH:-"${BASE_FOLDER}/checkpoint/qwen3_5-35B-A3B_slime_geo3k"}
 DATASET_PATH=${DATASET_PATH:-"${BASE_FOLDER}/${DATASET_LOCAL_NAME}"}
 
 MODEL_NAME_LOWER=$(echo "$MODEL_NAME" | tr '[:upper:]' '[:lower:]')
@@ -60,21 +60,36 @@ else
 fi
 echo "HAS_NVLINK: $HAS_NVLINK (detected $NVLINK_COUNT NVLink references)"
 
-# Download model and dataset
-# mkdir -p /root/models /root/datasets
-# if [ ! -d "/root/models/${MODEL_NAME}" ]; then
-#    hf download Qwen/${MODEL_NAME} --local-dir /root/models/${MODEL_NAME}
-# fi
-# if [ ! -d "/root/datasets/${DATASET_LOCAL_NAME}" ]; then
-#    hf download --repo-type dataset ${DATASET_NAME} --local-dir /root/datasets/${DATASET_LOCAL_NAME}
-# fi
+# ===== Use local model and dataset =====
+if [ ! -d "${MODEL_PATH}" ]; then
+   echo "ERROR: MODEL_PATH does not exist: ${MODEL_PATH}"
+   exit 1
+fi
+
+if [ ! -d "${DATASET_PATH}" ]; then
+   echo "ERROR: DATASET_PATH does not exist: ${DATASET_PATH}"
+   exit 1
+fi
+
+if [ ! -f "${DATASET_PATH}/train.parquet" ]; then
+   echo "ERROR: train data does not exist: ${DATASET_PATH}/train.parquet"
+   exit 1
+fi
+
+if [ ! -f "${DATASET_PATH}/test.parquet" ]; then
+   echo "ERROR: eval data does not exist: ${DATASET_PATH}/test.parquet"
+   exit 1
+fi
 
 # Common args
 CKPT_ARGS=(
    --hf-checkpoint "${MODEL_PATH}"
    --load "${MODEL_PATH}"
    --megatron-to-hf-mode bridge
+   # --save "${SAVE_PATH}"
+   # --save-interval 1
 )
+
 
 ROLLOUT_ARGS=(
    --prompt-data "${DATASET_PATH}/train.parquet"
@@ -120,21 +135,11 @@ OPTIMIZER_ARGS=(
    --adam-beta2 0.98
 )
 
+# ===== Modified: 35B-A3B does not need 8-GPU EP SGLang setting =====
 SGLANG_ARGS=(
-   --rollout-num-gpus-per-engine 8
-   --sglang-mamba-scheduler-strategy extra_buffer
-
-   --sglang-mem-fraction-static 0.3
-   --sglang-ep-size 8
-   --sglang-cuda-graph-bs 1 2 4 8 16 24 32 40 48 56 64 72 80 88 96 104 112 120 128 136 144 152 160 168 176 184 192 200 208 216 224 232 240 248 256
-
-   # MTP speculative decoding
-   # --sglang-speculative-algorithm EAGLE
-   # --sglang-speculative-num-steps 2
-   # --sglang-speculative-eagle-topk 1
-   # --sglang-speculative-num-draft-tokens 3
-
-   --sglang-max-running-requests 512
+   --rollout-num-gpus-per-engine 2
+   --sglang-mem-fraction-static 0.6
+   --sglang-max-running-requests 128
 )
 
 # Wandb args (only if WANDB_API_KEY is set)
@@ -158,13 +163,15 @@ MISC_ARGS=(
 # megatron backend
 BACKEND_ARGS=(
    --train-backend megatron
-   # Qwen3.5-35B-A3B has num_query_groups = 2
-   --tensor-model-parallel-size 2
+
+   # ===== Modified: 35B-A3B dense model parallel config =====
+   --tensor-model-parallel-size 4
    --sequence-parallel
    --pipeline-model-parallel-size 1
    --context-parallel-size 1
-   --expert-model-parallel-size 8
+   --expert-model-parallel-size 1
    --expert-tensor-parallel-size 1
+
    --recompute-granularity full
    --recompute-method uniform
    --recompute-num-layers 1
@@ -180,6 +187,8 @@ BACKEND_ARGS=(
 )
 
 SLIME_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." &>/dev/null && pwd)"
+
+# ===== Modified: source 35B-A3B model config =====
 source "${SLIME_DIR}/scripts/models/qwen3.5-35B-A3B.sh"
 
 # Start Ray if not using external Ray
@@ -190,19 +199,9 @@ if [ "$USE_EXTERNAL_RAY" = "0" ]; then
 fi
 
 # Build runtime env
-# RUNTIME_ENV_JSON="{
-#   \"env_vars\": {
-#     \"PYTHONPATH\": \"/gemini/space/gjx/slime:/gemini/space/gjx/Megatron-Bridge-slime/src:/root/Megatron-LM/\",
-#     \"CUDA_DEVICE_MAX_CONNECTIONS\": \"1\",
-#     \"NCCL_NVLS_ENABLE\": \"${HAS_NVLINK}\",
-#     \"SGLANG_ENABLE_SPEC_V2\": \"1\"
-#   }
-# }"
-
-# Build runtime env
 RUNTIME_ENV_JSON="{
   \"env_vars\": {
-    \"PYTHONPATH\": \"/gemini/space/gjx/slime:/gemini/space/gjx/Megatron-Bridge-slime/src:/root/Megatron-LM/\",
+    \"PYTHONPATH\": \"/root/Megatron-LM/\",
     \"CUDA_DEVICE_MAX_CONNECTIONS\": \"1\",
     \"NCCL_NVLS_ENABLE\": \"${HAS_NVLINK}\"
   }
