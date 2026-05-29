@@ -22,6 +22,9 @@ BASE_FOLDER=${BASE_FOLDER:-/gemini/space/gjx/slime_info}
 MODEL_PATH=${MODEL_PATH:-"${BASE_FOLDER}/${MODEL_NAME}"}
 SAVE_PATH=${SAVE_PATH:-"${BASE_FOLDER}/checkpoint/qwen3.5-4B_slime_geo3k"}
 DATASET_PATH=${DATASET_PATH:-"${BASE_FOLDER}/${DATASET_LOCAL_NAME}"}
+TENSORBOARD_DIR=${TENSORBOARD_DIR:-"${SAVE_PATH}/tensorboard"}
+LOG_DIR=${LOG_DIR:-"${SAVE_PATH}/logs"}
+LOG_FILE=${LOG_FILE:-"${LOG_DIR}/run_$(date +%Y%m%d_%H%M%S).log"}
 
 MODEL_NAME_LOWER=$(echo "$MODEL_NAME" | tr '[:upper:]' '[:lower:]')
 
@@ -31,6 +34,10 @@ if [ -z "$SLIME_SCRIPT_EXTERNAL_RAY" ] || [ "$SLIME_SCRIPT_EXTERNAL_RAY" = "0" ]
 else
    USE_EXTERNAL_RAY=1
 fi
+
+mkdir -p "${LOG_DIR}"
+exec > >(tee -a "${LOG_FILE}") 2>&1
+echo "Logging to ${LOG_FILE}"
 
 # Cleanup
 pkill -9 sglang
@@ -80,6 +87,8 @@ if [ ! -f "${DATASET_PATH}/test.parquet" ]; then
    echo "ERROR: eval data does not exist: ${DATASET_PATH}/test.parquet"
    exit 1
 fi
+
+mkdir -p "${SAVE_PATH}" "${TENSORBOARD_DIR}"
 
 # Common args
 CKPT_ARGS=(
@@ -211,6 +220,7 @@ RUNTIME_ENV_JSON="{
     \"PYTHONPATH\": \"/gemini/space/gjx/slime:/gemini/space/gjx/Megatron-Bridge-slime/src:/root/Megatron-LM/\",
     \"CUDA_DEVICE_MAX_CONNECTIONS\": \"1\",
     \"NCCL_NVLS_ENABLE\": \"${HAS_NVLINK}\",
+    \"TENSORBOARD_DIR\": \"${TENSORBOARD_DIR}\",
     \"SLIME_WAIT_SGLANG_GENERATE_READY\": \"1\",
     \"SLIME_SGLANG_READY_TIMEOUT\": \"900\",
     \"SLIME_SGLANG_READY_INTERVAL\": \"5\"
@@ -218,7 +228,7 @@ RUNTIME_ENV_JSON="{
 }"
 
 TENSORBOARD_ARGS=(
-   --tensorboard-dir "${SAVE_PATH}/tensorboard"
+   --use-tensorboard
 )
 
 ray job submit --address="http://127.0.0.1:8265" \
